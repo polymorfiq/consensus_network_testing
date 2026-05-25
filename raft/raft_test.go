@@ -3,6 +3,7 @@ package raft
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"testing"
 	"time"
 )
@@ -58,34 +59,69 @@ func TestCluster(t *testing.T) {
 		}
 	}
 
-	t.Logf("Cutting leader network...")
-	for conn := range leader.router.Connections() {
-		conn.SetDropOutgoingNth(1)
+	t.Logf("Cutting leader network (%s)...", leader.Id)
+	leader.router.SetDropOutgoing(true)
+	delete(servers, leader.Id)
+
+	var stillAliveIds []string
+	for stillAlive := range maps.Keys(servers) {
+		stillAliveIds = append(stillAliveIds, stillAlive)
+	}
+
+	time.Sleep(5 * time.Second)
+	if err := appendToLog(servers, stillAliveIds[0], &SetLogEntry{Key: "AfterCut", Value: []byte("StoredLater")}); err != nil {
+		t.Fatal(err)
 	}
 
 	time.Sleep(1 * time.Second)
-	if leader.Id != "A" {
-		appendToLog(servers, "A", &SetLogEntry{Key: "AfterCut", Value: []byte("StoredLater")})
-	} else {
-		appendToLog(servers, "C", &SetLogEntry{Key: "AfterCut", Value: []byte("StoredLater")})
+	if val, found, err := retrieveFromLog(servers, stillAliveIds[1], "AfterCut"); found != true || string(val) != "StoredLater" {
+		t.Fatalf("Expected AfterCut to have value StoredLater, but got %s (%v, %v)", string(val), found, err)
 	}
 
-	if leader.Id != "B" {
-		time.Sleep(1 * time.Second)
-		if val, found, err := retrieveFromLog(servers, "B", "AfterCut"); found != true || string(val) != "StoredLater" {
-			t.Errorf("Expected AfterCut to have value StoredLater, but got %s (%v, %v)", string(val), found, err)
-		}
-	} else {
-		time.Sleep(1 * time.Second)
-		if val, found, err := retrieveFromLog(servers, "D", "AfterCut"); found != true || string(val) != "StoredLater" {
-			t.Errorf("Expected AfterCut to have value StoredLater, but got %s (%v, %v)", string(val), found, err)
+	// Kill the leader...
+	var leaderTwo *Server
+	for _, server := range servers {
+		if server.State == Leader {
+			leaderTwo = server
 		}
 	}
 
+	t.Logf("Cutting 2nd leader network (%s)...", leaderTwo.Id)
+	leaderTwo.router.SetDropOutgoing(true)
+	delete(servers, leaderTwo.Id)
+
+	stillAliveIds = nil
+	for stillAlive := range maps.Keys(servers) {
+		stillAliveIds = append(stillAliveIds, stillAlive)
+	}
+
+	time.Sleep(5 * time.Second)
+	if err := appendToLog(servers, stillAliveIds[0], &SetLogEntry{Key: "SecondCut", Value: []byte("StoredAfterSecond")}); err != nil {
+		t.Error(err)
+		return
+	}
+
+	time.Sleep(1 * time.Second)
+	if err := appendToLog(servers, stillAliveIds[0], &SetLogEntry{Key: "SecondCut", Value: []byte("ReallyStoredAfterSecond")}); err != nil {
+		t.Error(err)
+		return
+	}
+
+	time.Sleep(1 * time.Second)
+	if val, found, err := retrieveFromLog(servers, stillAliveIds[1], "SecondCut"); found != true || string(val) != "ReallyStoredAfterSecond" {
+		t.Errorf("Expected SecondCut to have value ReallyStoredAfterSecond, but got %s (%v, %v)", string(val), found, err)
+	}
+
+	time.Sleep(5 * time.Second)
 }
 
 func appendToLog(servers map[string]*Server, id string, entry LogEntry) error {
-	ok, redirectToId, err := servers[id].Append(entry)
+	server, serverExists := servers[id]
+	if !serverExists {
+		return errors.New("server not found")
+	}
+
+	ok, redirectToId, err := server.Append(entry)
 
 	var redirectId string
 	if redirectToId != nil {

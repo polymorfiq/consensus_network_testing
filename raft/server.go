@@ -95,29 +95,27 @@ func (server *Server) Retrieve(key string) ([]byte, bool, *network.RouterAddress
 }
 
 func (server *Server) performLeadership() {
-	wg := sync.WaitGroup{}
 	for addr := range server.router.Addresses() {
-		wg.Add(1)
 		go func() {
 			server.replicateTo(addr)
-			wg.Done()
 		}()
 	}
-
-	wg.Wait()
 }
 
 func (server *Server) replicateTo(addr network.RouterAddress) {
 	server.logRW.RLock()
 	defer server.logRW.RUnlock()
 
+	server.stateLock.Lock()
 	nextIdx, ok := server.NextIndex[addr]
+	server.stateLock.Unlock()
 
 	if !ok {
 		nextIdx = uint64(len(server.Log))
 	}
 
 	appendReq := NewAppendEntriesRpc()
+	appendReq.Term = server.CurrentTerm
 	appendReq.PrevLogIndex = int64(nextIdx) - 1
 	appendReq.LeaderCommit = server.CommitIndex
 
@@ -148,8 +146,7 @@ func (server *Server) processRpcs() {
 	for {
 		var heartbeat <-chan time.Time
 		if server.State == Leader {
-			heartbeatJiggle := rand.IntN(50)
-			heartbeat = time.After(time.Millisecond * time.Duration(heartbeatJiggle))
+			heartbeat = time.After(time.Millisecond * time.Duration(50))
 		} else {
 			electionTimeoutJiggle := rand.IntN(150)
 			heartbeat = time.After(time.Millisecond * time.Duration(150+electionTimeoutJiggle))
@@ -166,9 +163,12 @@ func (server *Server) processRpcs() {
 			case AppendResponse:
 				appendResp := receipt.Message.(*AppendRespRpc)
 
-				if server.NextIndex[receipt.FromAddress] != server.SentIndex[receipt.FromAddress] {
-					fmt.Printf("Received AppendResponse from %s - %v\n", receipt.FromAddress, appendResp)
+				server.stateLock.Lock()
+				sentIdx, didSendIdx := server.SentIndex[receipt.FromAddress]
+				if didSendIdx && server.NextIndex[receipt.FromAddress] != sentIdx {
+					fmt.Printf("%s: Received AppendResponse from %s - %v\n", server.Id, receipt.FromAddress, appendResp.Success)
 				}
+				server.stateLock.Unlock()
 
 				if appendResp.Term > server.CurrentTerm {
 					server.becomeFollower(&receipt.FromAddress, appendResp.Term)
@@ -176,17 +176,21 @@ func (server *Server) processRpcs() {
 				}
 
 				if server.State == Leader && appendResp.Success {
+					server.stateLock.Lock()
 					server.MatchIndex[receipt.FromAddress] = server.SentIndex[receipt.FromAddress]
 					server.NextIndex[receipt.FromAddress] = server.SentIndex[receipt.FromAddress]
+					server.stateLock.Unlock()
 				} else if server.State == Leader && !appendResp.Success {
+					server.stateLock.Lock()
 					server.NextIndex[receipt.FromAddress]--
+					server.stateLock.Unlock()
 				}
 
 			case VoteResponse:
 				voteResp := receipt.Message.(*VoteRespRpc)
 
 				if voteResp.Term > server.CurrentTerm {
-					server.becomeFollower(&receipt.FromAddress, voteResp.Term)
+					server.CurrentTerm = voteResp.Term
 					continue
 				}
 
@@ -198,6 +202,7 @@ func (server *Server) processRpcs() {
 					majorityConns := math.Floor(float64(server.router.NumConnections())/2.0) + 1
 					if server.voteCount >= uint64(majorityConns) {
 						server.becomeLeader()
+						server.performLeadership()
 					}
 				}
 
@@ -208,13 +213,15 @@ func (server *Server) processRpcs() {
 				appendResp.Term = server.CurrentTerm
 				appendResp.Success = true
 
-				if server.State == Candidate && appendEntries.Term >= server.CurrentTerm {
-					server.becomeFollower(&receipt.FromAddress, appendEntries.Term)
-				} else if server.State == Candidate {
-					appendResp.Success = false
-				} else if server.State == Leader && appendEntries.Term > server.CurrentTerm {
+				if server.State == Leader && appendEntries.Term > server.CurrentTerm {
 					server.becomeFollower(&receipt.FromAddress, appendEntries.Term)
 				} else if server.State == Leader {
+					fmt.Printf("%s: Append rejected from %s: (Competitor Leader)\n", server.Id, receipt.FromAddress)
+					appendResp.Success = false
+				} else if appendEntries.Term >= server.CurrentTerm {
+					server.becomeFollower(&receipt.FromAddress, appendEntries.Term)
+				} else if server.State == Candidate {
+					fmt.Printf("%s: Append rejected from %s: (Still Candidate)\n", server.Id, receipt.FromAddress)
 					appendResp.Success = false
 				}
 
@@ -226,33 +233,38 @@ func (server *Server) processRpcs() {
 					prevLogEntry := server.Log[appendEntries.PrevLogIndex]
 
 					if prevLogEntry.Term != appendEntries.PrevLogTerm {
+						fmt.Printf("%s: Append rejected from %s: (Prev Log Term)\n", server.Id, receipt.FromAddress)
 						appendResp.Success = false
 					}
 				} else {
+					fmt.Printf("%s: Append rejected from %s: (Missing indices - %d vs %d)\n", server.Id, receipt.FromAddress, appendEntries.PrevLogIndex, len(server.Log))
 					appendResp.Success = false
+				}
+
+				if appendResp.Success {
+					server.logRW.Lock()
+					server.Log = server.Log[:appendEntries.PrevLogIndex+1]
+					for _, entry := range appendEntries.LogEntries {
+						server.Log = append(server.Log, entry)
+					}
+					server.logRW.Unlock()
+
+					if len(appendEntries.LogEntries) > 0 {
+						fmt.Printf("%s: Stored entries from %s: %d\n", server.Id, receipt.FromAddress, len(appendEntries.LogEntries))
+					}
 				}
 
 				msg := network.NewRouterMessage[Rpc]()
 				msg.RouterDeliveryType = network.BroadcastTargets
 				msg.Targets = []network.RouterAddress{receipt.FromAddress}
 				msg.Message = appendResp
-				err := server.router.Send(msg)
-				if err != nil {
-					fmt.Printf("Failed to send AppendResponse to %s: %v\n", receipt.FromAddress, err)
-					continue
-				}
 
-				if appendResp.Success {
-					for _, entry := range appendEntries.LogEntries {
-						server.Log = append(server.Log[appendEntries.PrevLogIndex+1:], entry)
+				if len(appendEntries.LogEntries) > 0 {
+					err := server.router.Send(msg)
+					if err != nil {
+						fmt.Printf("Failed to send AppendResponse to %s: %v\n", receipt.FromAddress, err)
+						continue
 					}
-
-					if len(appendEntries.LogEntries) > 0 {
-						fmt.Printf("%s: (%d) Received append entries: %v\n", server.Id, len(server.Log), appendEntries)
-						fmt.Printf("%s: Respond append entries: %v\n", server.Id, appendResp)
-					}
-				} else {
-					fmt.Printf("%s: Append failed %v\n", server.Id, appendEntries)
 				}
 
 			case RequestVote:
@@ -263,11 +275,16 @@ func (server *Server) processRpcs() {
 				voteResp.VoteGranted = true
 
 				if voteReq.Term < server.CurrentTerm {
+					fmt.Printf("%s: Vote Rejected for %s: (Outdated Term)\n", server.Id, receipt.FromAddress)
 					voteResp.VoteGranted = false
+				} else if server.State == Candidate && voteReq.Term <= server.CurrentTerm {
+					voteResp.VoteGranted = false
+					fmt.Printf("%s: Vote Rejected for %s: (Competitor Candidate)\n", server.Id, receipt.FromAddress)
 				}
 
 				if server.votedFor != nil && (*server.votedFor) != receipt.FromAddress {
 					voteResp.VoteGranted = false
+					fmt.Printf("%s: Vote Rejected for %s: (Already Voted)\n", server.Id, receipt.FromAddress)
 				}
 
 				var lastEntry LogTermEntry
@@ -276,8 +293,10 @@ func (server *Server) processRpcs() {
 				}
 
 				if voteReq.LastLogIndex < uint64(len(server.Log)) {
+					fmt.Printf("%s: Vote Rejected for %s: (LastLogIndex)\n", server.Id, receipt.FromAddress)
 					voteResp.VoteGranted = false
-				} else if voteReq.LastLogTerm < lastEntry.Term {
+				} else if len(server.Log) > 0 && voteReq.LastLogTerm < lastEntry.Term {
+					fmt.Printf("%s: Vote Rejected for %s: (LastLogTerm)\n", server.Id, receipt.FromAddress)
 					voteResp.VoteGranted = false
 				}
 
@@ -293,9 +312,6 @@ func (server *Server) processRpcs() {
 					server.votedFor = votedFor
 
 					fmt.Printf("%s: Voted for %s\n", server.Id, receipt.FromAddress)
-				}
-
-				if voteReq.Term > server.CurrentTerm {
 					server.becomeFollower(&receipt.FromAddress, voteReq.Term)
 				}
 			}
@@ -315,12 +331,12 @@ func (server *Server) becomeFollower(leaderId *network.RouterAddress, term uint6
 	defer server.stateLock.Unlock()
 	server.CurrentTerm = term
 	server.LeaderId = leaderId
+	server.votedFor = nil
 
 	if server.State != Follower {
 		fmt.Printf("%s: becomeFollower\n", server.Id)
 
 		server.State = Follower
-		server.voteCount = 0
 	}
 }
 
@@ -332,6 +348,7 @@ func (server *Server) becomeLeader() {
 	server.LeaderId = nil
 	server.State = Leader
 	server.voteCount = 0
+	server.votedFor = nil
 
 	for serverId := range server.router.Addresses() {
 		server.NextIndex[serverId] = uint64(len(server.Log))
@@ -346,14 +363,19 @@ func (server *Server) becomeLeader() {
 func (server *Server) electNewLeader() {
 	server.stateLock.Lock()
 	defer server.stateLock.Unlock()
-	fmt.Printf("%s: electNewLeader\n", server.Id)
+	fmt.Printf("%s: electNewLeader: %d\n", server.Id, server.CurrentTerm)
 
 	server.State = Candidate
 	server.CurrentTerm += 1
+	server.votedFor = nil
 
 	reqVote := NewRequestVoteRpc()
 	reqVote.Term = server.CurrentTerm
 	reqVote.LastLogIndex = uint64(len(server.Log))
+	if len(server.Log) > 0 {
+		lastEntry := server.Log[len(server.Log)-1]
+		reqVote.LastLogTerm = lastEntry.Term
+	}
 
 	msg := network.NewRouterMessage[Rpc]()
 	msg.RouterDeliveryType = network.BroadcastAll

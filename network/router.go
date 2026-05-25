@@ -13,6 +13,8 @@ type Router[T any] struct {
 	membershipLock sync.Mutex
 	incoming       chan RouterReceipt[T]
 	outgoing       chan RouterMessage[T]
+	dropIncoming   bool
+	dropOutgoing   bool
 }
 
 func NewRouter[T any]() *Router[T] {
@@ -48,16 +50,16 @@ func (router *Router[T]) Send(outgoing *RouterMessage[T]) error {
 		}
 	}
 
-	wg := sync.WaitGroup{}
+	if router.dropOutgoing {
+		return nil
+	}
+
 	for _, target := range targets {
-		wg.Add(1)
 		go func() {
 			target.Outgoing() <- outgoing.Message
-			wg.Done()
 		}()
 	}
 
-	wg.Wait()
 	return nil
 }
 
@@ -75,6 +77,9 @@ func (router *Router[T]) Add(id RouterAddress, conn Connection[T]) {
 			msg, ok := <-conn.Incoming()
 
 			if !ok {
+				return
+			}
+			if router.dropIncoming {
 				return
 			}
 
@@ -111,6 +116,14 @@ func (router *Router[T]) Addresses() iter.Seq[RouterAddress] {
 
 func (router *Router[T]) Connections() iter.Seq[Connection[T]] {
 	return maps.Values(router.connections)
+}
+
+func (router *Router[T]) SetDropIncoming(enabled bool) {
+	router.dropIncoming = enabled
+}
+
+func (router *Router[T]) SetDropOutgoing(enabled bool) {
+	router.dropOutgoing = enabled
 }
 
 type RouterDeliveryType int
